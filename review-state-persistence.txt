@@ -1,0 +1,428 @@
+# State Management & Persistence Correctness Review
+
+Review date: 2026-05-04
+Files examined: main.dart, database.dart, database.g.dart, chat_repository.dart,
+                chat_providers.dart, model_repository.dart, model_importer.dart,
+                model_profile.dart, inference_service.dart, inference_isolate.dart,
+                inference_command.dart, inference_event.dart, sampling_params.dart,
+                inference_config.dart
+
+---
+
+## 1. Provider overrides in main.dart — SAFE (confirmed)
+
+**Files:** `lib/main.dart:13-24`, `lib/src/models/model_repository.dart:55-57,203-205`
+
+The `databaseProvider` and `modelRepositoryProvider` both have default constructors that throw `UnimplementedError`:
+
+```dart
+final databaseProvider = Provider<LocalDatabase>((ref) {
+  throw UnimplementedError('Database must be initialised before use');
+});
+```
+
+In `main.dart`, the database and model repo are fully initialised **before** `runApp()`:
+
+```dart
+final db = await initDatabase();                  // line 10
+final modelRepo = ModelRepository(db: db, sharedPrefs: sharedPrefs);  // line 13
+await modelRepo.refresh();                         // line 14
+
+runApp(
+  ProviderScope(
+    overrides: [                                    // lines 17-18
+      databaseProvider.overrideWithValue(db),
+      modelRepositoryProvider.overrideWithValue(modelRepo),
+    ],
+    child: const MainApp(),
+  ),
+);
+```
+
+**Finding:** ✅ **Safe.** Riverpod resolves providers lazily — no widget accesses them until the first frame, which happens after `runApp()`. The `ProviderScope` wraps the entire widget tree, so every descendant of `MainApp` sees the overridden values. The `UnimplementedError` in the default constructors is an intentional pattern ensuring that any code path bypassing the override would fail loudly at development time. No risk of a widget tree building before the override is in place.
+
+---
+
+## 2. ModelRepository vs Drift double-write — DRIFT DETECTED (bug)
+
+**Files:** `lib/src/models/model_repository.dart:93-108` (addModel), `lib/src/models/model_repository.dart:138-147` (refresh), `lib/src/models/model_importer.dart:526-557` (_writeSidecar)
+
+### On import (`addModel`):
+Two writes happen:
+1. **Drift row** inserted: `model_repository.dart:93-101`
+   ```dart
+   await db.into(db.modelEntries).insert(ModelEntriesCompanion(...));
+   ```
+2. **Sidecar `.json` file** written: `model_importer.dart:526-557`
+   ```dart
+   await _writeSidecar(modelsDir, uuid, result);
+   ```
+
+### On refresh (`model_repository.dart:138-147`):
+Only sidecar files are read — Drift is never consulted:
+```dart
+Future<void> refresh() async {
+  final imported = await ModelImporter.scanImportedModels();  // reads .json files only
+  _models = imported.map(_resultToEntry).toList();
+  // ...
+}
+```
+
+### Drift Drift Scenarios:
+
+| Scenario | Effect |
+|----------|--------|
+| `removeModel` deletes Drift row, but file delete fails silently (wrapped in try/catch at `model_importer.dart:319-323`) | Sidecar survives → `refresh()` resurrects the model that was "deleted" |
+| `addModel` writes Drift row, but `writeProfile` (`model_importer.dart:385-394`) only updates the sidecar file | Drift `profile_json` column is **never populated or updated** — it remains null forever |
+| Drift rows accumulate over time (inserted on import, never cleaned up except by `removeModel`) | `refresh()` never reads them, so they are dead rows |
+
+### `writeProfile` updates the sidecar but not Drift:
+```dart
+// model_importer.dart:385-394
+static Future<void> writeProfile(String uuid, ModelProfile profile) async {
+  final file = File('${modelsDir.path}/$uuid.json');
+  // ... updates the JSON file, never touches Drift
+}
+```
+
+**Finding:** 🔴 **Drift and filesystem WILL drift out of sync.** The sidecar files are the de facto source of truth for `refresh()`, but Drift rows are written on import and never re-synced. Profile data only goes to sidecar files, not Drift. If a file delete fails silently during `removeModel`, the model reappears on next refresh.
+
+**Suggested fix:** Either (a) eliminate the dual storage by making sidecar files the single source of truth and removing Drift `model_entries`, or (b) after `refresh()`, upsert all sidecar data back into Drift to keep them in sync. Also write profile data to Drift's `profile_json` column in `writeProfile()`.
+
+---
+
+## 3. ChatRepository.watchConversations() N+1 problem — CONFIRMED (performance bug)
+
+**File:** `lib/src/chat/chat_repository.dart:88-116`
+
+```dart
+Stream<List<ConversationSummary>> watchConversations() {
+  final query = db.select(db.conversations)
+    ..where((t) => t.archived.equals(false))
+    ..orderBy([(t) => OrderingTerm(expression: t.updatedAt, mode: OrderingMode.desc)]);
+
+  return query.watch().asyncMap((rows) async {
+    final summaries = <ConversationSummary>[];
+    for (final row in rows) {                          // ← for each conversation...
+      final messageCount = await (db.select(db.messages)    // QUERY 1: count
+            ..where((t) => t.conversationId.equals(row.id))
+            ..where((t) => t.archived.equals(false)))
+          .get()
+          .then((msgs) => msgs.length);                // loads ALL messages just to count them
+
+      final lastMessage = await (db.select(db.messages)    // QUERY 2: last message
+            ..where((t) => t.conversationId.equals(row.id))
+            ..where((t) => t.archived.equals(false))
+            ..orderBy([(t) => ...desc])..limit(1))
+          .get()
+          .then((msgs) => msgs.isNotEmpty ? msgs.first.content : null);
+      // ...
+    }
+    return summaries;
+  });
+}
+```
+
+**Finding:** 🔴 **Confirmed N+1.** For N conversations, this fires **1 + 2N** queries on every stream emission. For 50 conversations, that's 101 DB queries. Additionally, the message count query loads ALL message rows into Dart just to check `.length` — a huge waste.
+
+**Suggested fix:** Use a single SQL join with aggregation:
+```sql
+SELECT c.*,
+       COUNT(m.id) AS message_count,
+       ml.content AS last_message_content
+FROM conversations c
+LEFT JOIN messages m ON m.conversation_id = c.id AND m.archived = 0
+LEFT JOIN messages ml ON ml.conversation_id = c.id
+    AND ml.archived = 0
+    AND ml.created_at = (
+        SELECT MAX(created_at) FROM messages
+        WHERE conversation_id = c.id AND archived = 0
+    )
+WHERE c.archived = 0
+GROUP BY c.id
+ORDER BY c.updated_at DESC
+```
+
+Or use Drift's `joinedQuery` / custom SQL for a single query. Also replace `.get().then((msgs) => msgs.length)` with `db.count(db.messages..where(...))` for an efficient COUNT query.
+
+---
+
+## 4. _archiveDescendants recursion — FUNCTIONALLY CORRECT but inefficient (note)
+
+**File:** `lib/src/chat/chat_repository.dart:202-215`
+
+```dart
+Future<void> _archiveDescendants(int conversationId, int parentId) async {
+  final children = await (db.select(db.messages)
+        ..where((t) => t.conversationId.equals(conversationId))
+        ..where((t) => t.parentMessageId.equals(parentId)))
+      .get();
+
+  for (final child in children) {
+    await _archiveDescendants(conversationId, child.id);
+  }
+
+  await (db.update(db.messages)
+        ..where((t) => t.id.equals(parentId)))
+      .write(const MessagesCompanion(archived: Value(true)));
+}
+```
+
+**Finding:** ✅ **Double-archiving is idempotent** — setting `archived=true` when it's already `true` is harmless. The recursion correctly traverses the tree depth-first, archiving children before the parent.
+
+**Performance note:** For each level of depth, a separate SELECT query is executed. For a chain of 10 messages, that's 10 SELECT + 10 UPDATE queries. For typical chat depths (<10), this is acceptable. For extremely deep trees, a recursive CTE in SQL would be more efficient.
+
+**Suggested fix (optional):** Replace Dart recursion with a single recursive CTE:
+```sql
+WITH RECURSIVE descendants AS (
+  SELECT id FROM messages WHERE id = :parentId
+  UNION ALL
+  SELECT m.id FROM messages m JOIN descendants d ON m.parent_message_id = d.id
+)
+UPDATE messages SET archived = 1 WHERE id IN descendants;
+```
+
+This reduces N+1 round-trips to 1.
+
+---
+
+## 5. ChatControllerNotifier branching logic — BUGS CONFIRMED (critical)
+
+**File:** `lib/src/chat/chat_providers.dart:90-135`
+
+### Bug 5a: `sendMessage` gives user and assistant messages the SAME `parentMessageId`
+
+```dart
+Future<void> sendMessage(String content, {int? parentMessageId}) async {
+  // ...
+  final userMsgId = await repo.addUserMessage(          // returns new user msg ID
+      conversationId: conversationId,
+      content: content,
+      parentMessageId: parentMessageId,                 // e.g., parentMessageId=5
+  );
+
+  final assistantId = await repo.createAssistantMessage(
+      conversationId: conversationId,
+      parentMessageId: parentMessageId,                  // ALSO parentMessageId=5 ← BUG
+  );
+  // ...
+}
+```
+
+The assistant message should have `parentMessageId` set to `userMsgId` (the newly created user message), not the original `parentMessageId`. This breaks the parent-child chain between the user message and its assistant response.
+
+### Bug 5b: `regenerate` duplicates the user message instead of just creating a new assistant
+
+```dart
+Future<void> regenerate(int messageId) async {
+  // ...archives old assistant...
+  final parentMsg = messages.where((m) => m.id == msg.parentMessageId).firstOrNull;
+  // ...
+  await sendMessage(parentMsg.content, parentMessageId: msg.parentMessageId);
+  //     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  //     Creates a NEW user message with the SAME content as the old user message.
+  //     For a pure "regenerate", you should NOT duplicate the user message.
+}
+```
+
+For a "regenerate" action, the expected behaviour is:
+- Archive the old assistant response
+- Create a single new assistant message linked to the existing parent user message
+
+Instead, `regenerate` calls `sendMessage` which creates **both** a new user message (with identical content to the old one) and a new assistant. This inflates the message tree and breaks the visual chain.
+
+### Bug 5c: `editAndResend` is correct but inherits Bug 5a
+
+```dart
+Future<void> editAndResend(int messageId, String newContent) async {
+  await repo.archiveBranchFrom(messageId);
+  await sendMessage(newContent, parentMessageId: messageId);
+}
+```
+
+The intent is right (archive old branch, create new branch with edited content), but because of Bug 5a, the new assistant won't be linked to the new user message.
+
+**Finding:** 🔴 **Three bugs in the branching logic:**
+1. `sendMessage` lines ~104-112: assistant gets same `parentMessageId` as user message instead of the new user message's ID
+2. `regenerate` lines ~127-134: should create only an assistant message, not duplicate the user message
+3. Combined effect: the message tree's parent-child links are broken after any branch operation
+
+**Suggested fixes:**
+```dart
+// Fix for sendMessage (5a):
+final userMsgId = await repo.addUserMessage(
+    conversationId: conversationId,
+    content: content,
+    parentMessageId: parentMessageId,
+);
+final assistantId = await repo.createAssistantMessage(
+    conversationId: conversationId,
+    parentMessageId: userMsgId,  // ← link to the NEW user message
+);
+
+// Fix for regenerate (5b) — create assistant directly, don't call sendMessage:
+Future<void> regenerate(int messageId) async {
+  await repo.archiveBranchFrom(messageId);
+  final msg = ...; // find old assistant message
+  if (msg == null || msg.parentMessageId == null) return;
+  final assistantId = await repo.createAssistantMessage(
+      conversationId: arg,
+      parentMessageId: msg.parentMessageId,  // link to the EXISTING user message
+  );
+  state = ChatGenerating(assistantMessageId: assistantId);
+  // TODO: trigger inference
+}
+```
+
+---
+
+## 6. FTS5 triggers — CORRECT (no issue)
+
+**File:** `lib/src/db/database.dart:38-56`
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+USING fts5(content, content=messages, content_rowid=id)
+```
+
+**Analysis:**
+- Drift generates the `messages` table with INTEGER PRIMARY KEY on `id` (rowid alias) and a `content` TEXT column → `content_rowid=id` is correct
+- FTS5 external content (`content=messages`) reads from the `messages.content` column → column name matches perfectly
+- Triggers:
+  - `messages_ai` AFTER INSERT: inserts `new.id, new.content` into FTS ✅
+  - `messages_ad` AFTER DELETE: uses `'delete'` special command ✅
+  - `messages_au` AFTER UPDATE: deletes old, inserts new ✅
+- Table name `messages_fts` matches the `messagesFtsTable` getter ✅
+
+**Finding:** ✅ **FTS5 setup is correct.** Drift uses the column name `content` for message text and `id` as INTEGER PRIMARY KEY (rowid alias). The external content reference `content=messages` correctly maps to the Drift-generated table. Triggers correctly handle INSERT, DELETE, and UPDATE sync.
+
+---
+
+## 7. ModelProfile JSON round-trip — CORRECT (no issue)
+
+**File:** `lib/src/models/model_profile.dart:57-116`
+
+### toJson():
+```dart
+Map<String, dynamic> toJson() => {
+  'n_ctx': nCtx,                                     // always written
+  'n_gpu_layers': nGpuLayers,                        // always written
+  if (systemPrompt != null) 'system_prompt': systemPrompt,   // conditional
+  if (samplingParams != null)                         // conditional
+    'sampling': { ... all 7 sampling fields ... },
+};
+```
+
+### fromJson():
+```dart
+factory ModelProfile.fromJson(Map<String, dynamic> json) {
+  return ModelProfile(
+    nCtx: (json['n_ctx'] as num?)?.toInt() ?? 4096,         // null-safe, has default
+    nGpuLayers: (json['n_gpu_layers'] as num?)?.toInt() ?? 0, // null-safe, has default
+    systemPrompt: json['system_prompt'] as String?,          // nullable, correct cast
+    samplingParams: json['sampling'] != null
+        ? SamplingParams(                                    // all fields have ?? defaults
+            temperature: (json['sampling']['temperature'] as num?)?.toDouble() ?? 1.0,
+            topK: (json['sampling']['top_k'] as num?)?.toInt() ?? 64,
+            topP: (json['sampling']['top_p'] as num?)?.toDouble() ?? 0.95,
+            minP: (json['sampling']['min_p'] as num?)?.toDouble() ?? 0.0,
+            repeatPenalty: (json['sampling']['repeat_penalty'] as num?)?.toDouble() ?? 1.0,
+            seed: (json['sampling']['seed'] as num?)?.toInt() ?? 0xFFFFFFFF,
+            maxTokens: (json['sampling']['max_tokens'] as num?)?.toInt() ?? 512,
+          )
+        : null,
+  );
+}
+```
+
+**Finding:** ✅ **Null-safe and round-trip safe.** Every field uses `as num?` / `as String?` with `??` defaults on deserialization. Missing keys (because `toJson` uses conditional includes) are handled gracefully. All sampling defaults in `fromJson` match the `SamplingParams` constructor defaults in `sampling_params.dart:6-14`. No issues.
+
+---
+
+## 8. App lifecycle and singleton disposal — BUGS CONFIRMED (critical)
+
+**File:** `lib/src/inference/inference_service.dart:150-163`
+
+```dart
+Future<void> dispose() async {
+  if (_tokenController != null && !_tokenController!.isClosed) {
+    await _tokenController!.close();
+  }
+  await _eventSub?.cancel();          // ← BUG: _eventSub is never assigned
+  if (_handles != null) {
+    _handles!.commandPort.send(const UnloadModelCommand());
+    _handles!.onExit;                 // ← BUG: dangling future, not awaited
+  }
+  _handles = null;
+  _loaded = false;
+  _generating = false;
+}
+```
+
+### Bug 8a: `_handles!.onExit` is fire-and-forget, and will never complete
+
+- `onExit` is defined in `inference_isolate.dart:32-38` as `exitReceive.first.then((_) {})`
+- It completes only when the spawned isolate exits (sends a message to `exitReceive`)
+- `UnloadModelCommand` only unloads the model — it does **not** kill the isolate
+- Therefore `_handles!.onExit` will **never complete** under normal operation
+- The expression `_handles!.onExit` without `await` is a dangling future — literally a no-op
+
+### Bug 8b: Isolate is never killed — resource leak
+
+- `dispose()` sends `UnloadModelCommand` but never tells the isolate to shut down
+- The isolate continues running with its C state (llama.cpp context) allocated in memory
+- If `dispose()` is called during app lifecycle events (backgrounding, etc.), the model stays loaded in memory
+
+### Bug 8c: `_eventSub?.cancel()` is a no-op
+
+- `_eventSub` is declared at `inference_service.dart:12` but never assigned anywhere
+- `start()`, `loadModel()`, and `generate()` all create **local** `sub` variables, never touch `_eventSub`
+
+### Partial mitigation for OS-killed apps:
+
+If the app is killed by the OS (not a graceful shutdown), the OS reclaims all memory including the C library's allocations. So there's no leak at process termination. But during **graceful** lifecycle transitions (e.g., Flutter's `AppLifecycleState.paused`), the leak is real.
+
+**Finding:** 🔴 **Three issues:**
+1. `_handles!.onExit` is a dead line (not awaited, never completes because isolate isn't killed)
+2. The inference isolate is never shut down — model memory stays allocated after `dispose()`
+3. `_eventSub?.cancel()` is a no-op because `_eventSub` is never assigned
+
+**Suggested fix:**
+```dart
+// 1. Add a ShutdownCommand:
+class ShutdownCommand extends InferenceCommand { const ShutdownCommand(); }
+
+// 2. Handle it in the isolate (_handle in inference_isolate.dart):
+case ShutdownCommand():
+  _unloadModel();
+  // Isolate will exit when there are no more active ports or explicitly
+
+// 3. Fix dispose():
+Future<void> dispose() async {
+  if (_tokenController != null && !_tokenController!.isClosed) {
+    await _tokenController!.close();
+  }
+  if (_handles != null) {
+    _handles!.commandPort.send(const ShutdownCommand());
+    await _handles!.onExit.timeout(Duration(seconds: 5));  // actually wait for exit
+  }
+  _handles = null;
+  _loaded = false;
+  _generating = false;
+}
+```
+
+---
+
+## Summary of Findings
+
+| # | Area | Severity | Status |
+|---|------|----------|--------|
+| 1 | Provider overrides timing | ✅ Safe | No action |
+| 2 | ModelRepository dual-storage drift | 🔴 Bug | Drift rows and sidecar files desync; profile data only goes to files |
+| 3 | N+1 in watchConversations() | 🔴 Perf | 1+2N queries per emission |
+| 4 | _archiveDescendants recursion | ✅ Correct | Idempotent, acceptable for typical depths |
+| 5 | ChatControllerNotifier branching | 🔴 Bug | 3 bugs: wrong parentMessageId chain, duplicate user msg on regenerate |
+| 6 | FTS5 triggers | ✅ Correct | External content mapping and triggers are correct |
+| 7 | ModelProfile JSON round-trip | ✅ Correct | Null-safe, defaults consistent |
+| 8 | InferenceService.dispose() | 🔴 Bug | Isolate leaks, onExit never awaited, _eventSub never assigned |

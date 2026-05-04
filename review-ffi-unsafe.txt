@@ -1,0 +1,438 @@
+================================================================================
+FFI / Native Layering & Isolate Safety Review
+================================================================================
+Date: 2026-05-04
+Scope: inference_isolate.dart, chat_template.dart, backend_probe.dart,
+       inference_service.dart, inference_command.dart, inference_event.dart,
+       inference_bindings.dart, inference.cpp (C wrapper)
+================================================================================
+
+TABLE OF CONTENTS
+  1.  Memory safety – _generate metrics allocations
+  2.  Memory safety – chat_template.dart double-free (CRITICAL)
+  3.  NativeCallable lifetime
+  4.  Isolate crash resilience – UI hang (HIGH)
+  5.  Cancel safety – fundamentally broken (CRITICAL)
+  6.  SendPort serialisation
+  7.  ModelMetadata emptiness after load/unload
+  8.  Chat template double-free – detailed analysis
+  9.  InferenceService race on loadModel / unloadModel
+  10. Dead code / unused fields
+  11. Minor observations
+
+================================================================================
+1.  MEMORY SAFETY – _generate metrics allocations
+================================================================================
+
+File:  lib/src/inference/inference_isolate.dart, lines 146–177
+
+Inside the `default:` switch arm of `_generate()`, four allocations are made
+and freed without a local try/finally:
+
+    final ttft   = calloc<Double>(1);
+    final tokps  = calloc<Double>(1);
+    final nPrompt = calloc<Int32>(1);
+    final nDec   = calloc<Int32>(1);
+
+    bindings.llm_get_metrics(ctx, ttft, tokps, nPrompt, nDec);
+
+    _gEventSink?.send(GenerationDoneEvent( … ));
+
+    calloc.free(ttft);
+    calloc.free(tokps);
+    calloc.free(nPrompt);
+    calloc.free(nDec);
+
+If either `llm_get_metrics` (an FFI call) or `_gEventSink?.send()` throws,
+all four allocations leak.  While an FFI call writing to pre-allocated
+buffers is unlikely to throw a Dart exception in practice, `_gEventSink?.send`
+could fail if the receiving isolate has exited, making the send throw.
+
+Severity:  Medium (low probability, but a simple fix exists)
+
+Fix:       Wrap the metric reads and frees in a nested try/finally inside the
+           `default:` case.
+
+================================================================================
+2.  MEMORY SAFETY – chat_template.dart double-free (CRITICAL)
+================================================================================
+
+File:  lib/src/inference/chat_template.dart, lines 91–113
+
+The `applyTemplate` method has a **double-free** on `outBuf` when the buffer
+is too small (result > outSize):
+
+    final outBuf = calloc<Char>(outSize);
+    try {
+      final result = bindings.llm_apply_chat_template(ctx, jsonNative, outBuf, outSize);
+      if (result > 0) {
+        if (result > outSize) {
+          calloc.free(outBuf);          // <--- FREE #1: frees outBuf
+          final biggerBuf = calloc<Char>(result + 1);
+          try {
+            final r2 = bindings.llm_apply_chat_template(ctx, jsonNative, biggerBuf, result + 1);
+            …
+          } finally {
+            calloc.free(biggerBuf);     // <--- FREE #2
+          }
+        }
+        …
+      }
+      return null;
+    } finally {
+      calloc.free(outBuf);              // <--- FREE #3: DOUBLE FREE of outBuf!
+      calloc.free(jsonNative);
+    }
+
+When `result > outSize`, FREE #1 is executed inside the `if` block, then
+the outer `finally` (FREE #3) calls `calloc.free` on the same pointer.
+This is undefined behaviour – corrupting the native allocator's bookkeeping.
+
+Severity:  CRITICAL – immediate crash or memory corruption when a chat
+           template message is longer than the initial estimate (~1024–32768
+           bytes).
+
+Fix:       Restructure the logic so `outBuf` is freed exactly once.  For
+           example, set `outBuf = null` after FREE #1 and only call
+           `calloc.free(outBuf)` in the outer `finally` if it is non-null,
+           OR simply not free `outBuf` in the if-block and let the outer
+           `finally` handle it.  The cleanest fix: remove the early
+           `calloc.free(outBuf)` inside the `if (result > outSize)` block
+           and let the outer `finally` free the original buffer; then use a
+           separate boolean to know whether to read from `outBuf` or
+           `biggerBuf`.
+
+================================================================================
+3.  NativeCallable LIFETIME
+================================================================================
+
+File:  lib/src/inference/inference_isolate.dart, lines 65, 97–98
+
+    NativeCallable<llm_token_cbFunction>? _gTokenCallable;
+
+Created once in `_entryPoint`:
+
+    _gTokenCallable = NativeCallable<llm_token_cbFunction>.listener(_onToken);
+
+Since `_gTokenCallable` is a **top-level variable** in the isolate's Dart
+scope, the Dart GC will never collect it.  Top-level/static variables are
+roots in the GC heap and remain alive for the lifetime of the isolate.
+
+Verdict:  SAFE.  The NativeCallable will not be GC'd during the isolate's
+          lifespan.
+
+================================================================================
+4.  ISOLATE CRASH RESILIENCE – UI HANG (HIGH)
+================================================================================
+
+Files:  lib/src/inference/inference_isolate.dart, lines 36–43
+        lib/src/inference/inference_service.dart (entire file)
+
+`spawnInferenceIsolate` sets `onExit` for the isolate:
+
+    await Isolate.spawn(
+      _entryPoint,
+      _IsolateArgs(…),
+      onExit: exitReceive.sendPort,
+    );
+
+And returns:
+
+    onExit: exitReceive.first.then((_) {}),
+
+However, **`InferenceService` never subscribes to `onExit`**.  If the
+inference isolate dies unexpectedly (e.g. segfault in llama.cpp, OOM,
+Dart unhandled error), the following happens:
+
+  a) The command/event ReceivePorts in the main isolate become dead.
+  b) No more `InferenceEvent`s are delivered.
+  c) Any pending `completer.future` in `loadModel()`, `unloadModel()`,
+     or `generate()` **hangs forever** because the one-shot event listener
+     never fires.
+  d) Sending commands via the dead SendPort will silently fail or throw
+     `SendPortException` in newer Dart versions.
+  e) The UI thread blocks indefinitely on the Completer, making the app
+     appear frozen.
+
+Severity:  HIGH – a crashed inference isolate renders the app unusable
+           without any error recovery path.
+
+Fix:       Subscribe to `_handles.onExit` in `InferenceService`.  When it
+           fires, cancel all pending completers, close the token controller,
+           reset state (`_loaded = false`, `_generating = false`), and
+           optionally restart the isolate or surface an error.  Example:
+
+             _handles!.onExit.then((_) {
+               _loaded = false;
+               _generating = false;
+               _tokenController?.addError(…);
+               _tokenController?.close();
+               // also complete any pending completer from loadModel/unloadModel
+             });
+
+================================================================================
+5.  CANCEL SAFETY – FUNDAMENTALLY BROKEN (CRITICAL)
+================================================================================
+
+Files:  lib/src/inference/inference_isolate.dart, lines 110–140
+        lib/src/inference/inference_service.dart, lines 113–119
+        android/app/src/main/cpp/inference.cpp, lines 303–431
+
+The cancellation mechanism is architecturally broken.
+
+On the Dart side:
+
+    // inference_service.dart, cancel()
+    _handles!.commandPort.send(const CancelCommand());
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    // inference_isolate.dart, _handle()
+    case CancelCommand():
+      final b = _gBindings;
+      final ctx = _gCtx;
+      if (b != null && ctx != null) b.llm_cancel_generation(ctx);
+      _gEventSink?.send(const GenerationCancelledEvent());
+
+On the C side, `llm_start_generation` is a **synchronous, blocking call**
+that runs the entire decode loop before returning.  Inside the loop, it
+checks `state->cancel_flag`:
+
+    while (generated < max_tokens) {
+      if (state->cancel_flag.load() != 0) break;
+      // sample, detokenize, decode…
+    }
+
+The problem:  **A Dart isolate is single-threaded.**  While
+`llm_start_generation` is blocking the isolate's thread, NO messages on
+the command port can be processed.  The `CancelCommand` can only be
+dispatched AFTER `_generate()` returns, at which point `llm_start_generation`
+has already finished and returned 0 (success) or -1/-2/-3 (error).
+
+Therefore:
+
+  • `llm_cancel_generation` is never called while generation is in progress.
+  • The atomic flag is set after generation has already completed.
+  • The 50ms wait in `InferenceService.cancel()` is futile.
+  • Both `GenerationDoneEvent` AND `GenerationCancelledEvent` may be sent
+    (depending on timing), though the `default:` path checks
+    `state->cancel_flag.load()` and returns 1 if cancelled — but this check
+    happens after the loop exits, and the flag won't be set yet.
+
+To make cancellation work, `llm_start_generation` must run on a **separate
+native thread** so that the Dart isolate's event loop remains responsive.
+Options:
+
+  a) Use `Isolate.run` or a dedicated thread pool to call
+     `llm_start_generation` from a native thread (e.g., via a C++ std::thread
+     inside the C wrapper, communicating progress back through a callback
+     that posts to the Dart isolate).
+
+  b) Restructure the C API to be non-blocking / incremental (decode one
+     token per call), so the Dart event loop can process `CancelCommand`
+     between tokens.  This also enables true streaming back to the UI
+     without a callback.
+
+  c) At minimum, move `llm_cancel_generation` to be callable from a
+     *different* Dart isolate (e.g., a dedicated cancel worker), but that
+     adds complexity.
+
+Severity:  CRITICAL – cancellation is advertised as a feature but never
+           works in practice.  The 50ms delay is misleading.
+
+================================================================================
+6.  SendPort SERIALISATION
+================================================================================
+
+Files:  lib/src/inference/inference_command.dart
+        lib/src/inference/inference_event.dart
+        lib/src/inference/inference_config.dart
+        lib/src/inference/sampling_params.dart
+
+All classes sent across SendPorts are checked for sendability:
+
+  InferenceCommand (sealed)
+    ├── LoadModelCommand     → String, InferenceConfig (int×4, BackendHint enum)
+    ├── GenerateCommand      → String, SamplingParams (double×3, int×4), int?
+    ├── CancelCommand        → empty const
+    └── UnloadModelCommand   → empty const
+
+  InferenceEvent (sealed)
+    ├── ModelLoadedEvent     → ModelMetadata (String?×5, int×4)
+    ├── ModelLoadFailedEvent → String
+    ├── TokenEvent           → String, bool
+    ├── GenerationDoneEvent  → GenerationMetrics (double×2, int×2)
+    ├── GenerationCancelledEvent → empty const
+    └── GenerationErrorEvent → String
+
+All types are composed exclusively of:
+  • Primitives (String, int, double, bool)
+  • Nullable primitives (String?)
+  • Enums (BackendHint — sendable as int in Dart)
+  • Const objects
+
+No closures, `SendPort`s embedded in message payloads, or native resources
+are passed across the port boundary.
+
+Verdict:  SAFE.  All classes in the sealed hierarchies are fully sendable.
+
+================================================================================
+7.  ModelMetadata EMPTINESS AFTER LOAD/UNLOAD
+================================================================================
+
+File:  lib/src/inference/inference_isolate.dart, lines 83, 174
+
+Both `_loadModel` and `_unloadModel` send `ModelLoadedEvent` with an empty
+`ModelMetadata()`:
+
+    _gEventSink?.send(const ModelLoadedEvent(metadata: ModelMetadata()));
+
+All fields are defaults: `architecture=null`, `name=null`, `description=null`,
+`nParams=0`, `nCtxTrain=0`, `nEmbed=0`, `nLayer=0`, `fileType=null`,
+`chatTemplate=null`.
+
+This means:
+
+  a) After loading a model, `InferenceService.loadModel()` stores
+     `_lastMetadata` with all-null/all-zero values — completely useless
+     to the UI.
+
+  b) After unloading, another `ModelLoadedEvent(…empty…)` is sent, which
+     is semantically confusing: listeners see "ModelLoaded" with empty data
+     when the model has actually been unloaded.
+
+Severity:  LOW (data quality) — no crash, but the UI will show blank model
+           info after loading.  The C wrapper has access to GGUF metadata
+           (e.g., via `llama_model_meta_val_str` / `llama_model_meta_count`)
+           but never extracts it.
+
+Fix:       Either (a) extend the C API with `llm_get_model_metadata()` to
+           populate real values, or (b) use the Dart-side `GgufParser`
+           (`gguf_parser.dart`) alongside the load to extract metadata
+           from the GGUF file directly.
+
+================================================================================
+8.  CHAT TEMPLATE DOUBLE-FREE – DETAILED ANALYSIS
+================================================================================
+
+(Already covered in §2 above — this section provides additional detail.)
+
+File:  lib/src/inference/chat_template.dart, lines 95–109
+
+The outer `try { … } finally { calloc.free(outBuf); … }` always runs.
+When `result > outSize`, the inner `if` block frees `outBuf` and allocates
+`biggerBuf`.  The `finally` then frees `outBuf` again.
+
+Additionally, note the second `llm_apply_chat_template` call on line 105
+still uses the same `jsonNative` pointer (freed only in the outer `finally`
+on line 112).  This is **safe** — `jsonNative` is still alive — but worth
+noting for clarity.
+
+Severity:  CRITICAL (double-free) — will corrupt the native heap and crash.
+
+================================================================================
+9.  InferenceService RACE ON loadModel / unloadModel
+================================================================================
+
+File:  lib/src/inference/inference_service.dart
+
+Both `loadModel()` and `unloadModel()` create one-shot event subscriptions
+on `_handles!.eventPort` and wait for a matching event.
+
+If two concurrent calls are made (e.g. user taps "Load" twice quickly):
+
+  a) Two subscriptions are registered on the SAME event port.
+  b) Two `LoadModelCommand`s are sent to the isolate.
+  c) The isolate processes them sequentially.  The first `ModelLoadedEvent`
+     triggers BOTH subscriptions: the first caller completes correctly, and
+     the **second caller also completes** — but with the first model's
+     (empty) metadata.
+  d) The second `ModelLoadedEvent` (for the actual second call) arrives
+     but both subscriptions have already been cancelled, so it's silently
+     dropped.
+
+The `_ensureNotGenerating()` guard does NOT prevent this because both calls
+happen before the model is loaded (so `_loaded` is still false or true for
+the first call).
+
+The same race exists for `unloadModel`.
+
+Severity:  MEDIUM — leads to silently wrong state (wrong or no model).
+
+Fix:       Add an explicit `_loading` / `_unloading` flag and check/throw
+           in `loadModel` and `unloadModel`.  For example:
+
+             bool _loading = false;
+             Future<void> loadModel(...) async {
+               if (_loading) throw StateError('Already loading a model');
+               _loading = true;
+               try {
+                 // existing logic
+               } finally {
+                 _loading = false;
+               }
+             }
+
+================================================================================
+10.  DEAD CODE / UNUSED FIELDS
+================================================================================
+
+File:  lib/src/inference/inference_service.dart
+
+  • `StreamSubscription<dynamic>? _eventSub` (line 16) is declared but
+    **never assigned**.  It is only cancelled in `dispose()` (line 163),
+    but since it's always null, that's a no-op.  This appears to be a
+    leftover from a refactoring where per-method subscriptions replaced
+    a single long-lived subscription.
+
+    Fix:  Remove the field.
+
+  • `_lastMetadata` (line 27) is stored but only accessible via the
+    `lastMetadata` getter.  It is never surfaced to any UI in the
+    reviewed code.  This may be intentional (future use) but is dead
+    code today.
+
+================================================================================
+11.  MINOR OBSERVATIONS
+================================================================================
+
+11a.  `InferenceService.dispose()` sends `UnloadModelCommand` but never
+      waits for the response or kills the isolate.  The isolate continues
+      running with a dangling SendPort.  Consider actually calling
+      `isolate.kill()` if appropriate.
+
+11b.  `backend_probe.dart` is clean — both `vk` and `cl` allocations are
+      freed in the try/finally.  No issues found.
+
+11c.  The `llm_get_metrics` C function (inference.cpp line 475) accepts
+      null pointers for all output parameters and guards each one.  The
+      Dart side never passes null, so this is safe but worth noting as
+      defensive design.
+
+11d.  In `inference_isolate.dart` `_onToken`, the `user` parameter (the
+      `Pointer<Void>`) is never read — this is fine since the token
+      callback routes through global state.  The `userData` allocation
+      (`calloc<IntPtr>(1)`) is a placeholder and a minor 8-byte waste.
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+ID  Finding                                                Sev       Fix?
+──  ─────────────────────────────────────────────────────  ────────  ─────
+1   _generate metrics: 4 allocations unprotected by        Medium    Wrap in inner try/finally
+    try/finally – potential leak
+2   chat_template.dart double-free on outBuf               CRITICAL  Restructure to free exactly once
+3   NativeCallable lifetime                                SAFE      –
+4   Isolate crash: UI hangs forever (onExit never used)    HIGH      Subscribe to onExit, cancel pending ops
+5   Cancel: fundamentally broken (single-threaded          CRITICAL  Restructure to non-blocking C API or
+    isolate blocks on synchronous FFI call)                          dedicated native thread
+6   SendPort serialisation                                 SAFE      –
+7   ModelMetadata always empty after load/unload           LOW       Extract real GGUF metadata
+8   (duplicate of #2)                                                –
+9   Race condition on concurrent loadModel/unloadModel     MEDIUM    Add _loading/_unloading guards
+10  Dead code: _eventSub never assigned                    LOW       Remove unused field
+11  Minor observations                                     LOW       See §11
+
+================================================================================
+END OF REVIEW
+================================================================================

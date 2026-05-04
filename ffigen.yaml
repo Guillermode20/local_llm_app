@@ -1,0 +1,10 @@
+name: InferenceBindings
+description: Dart FFI bindings for the native inference ABI.
+output: lib/src/native/inference_bindings.dart
+headers:
+  entry-points:
+    - android/app/src/main/cpp/inference.h
+  include-directives:
+    - android/app/src/main/cpp/inference.h
+compiler-opts:
+  - -Iandroid/app/src/main/cpp

@@ -1,0 +1,260 @@
+# UI Implementation & Unfinished Wiring — Review Findings
+
+**Date:** 2026-05-04
+**Scope:** Chat UI screens, widgets, and completeness of the user-facing experience.
+
+---
+
+## 1. Unwired Features: Generate→Stream→Render Pipeline (Fatally Non-Functional)
+
+**Severity: BLOCKER**
+
+`ChatControllerNotifier.sendMessage()` (chat_providers.dart, line 77–93) contains a hard TODO:
+
+```dart
+// TODO: Hook into InferenceService to start generation
+// and stream tokens into repo.appendToMessage()
+// This will be wired in Phase 5
+```
+
+After creating an empty assistant message and transitioning state to `ChatGenerating`, the method returns without ever calling `InferenceService.generate()`. The assistant message remains empty (`content: ''`), `appendToken()` (line 96–103) is never called, and `finaliseGeneration()` (line 105–113) is never called.
+
+Similarly, `cancelGeneration()` (line 116–118) only resets state to `ChatIdle` without calling `InferenceService.cancel()`.
+
+**Impact on UI:**
+- The **Stop button** (chat_composer.dart, line 76–83) calls `onStop` → `_handleStop` → `cancelGeneration()`, which immediately sets `_isGenerating = false` (chat_screen.dart, line 61–65). The button works in the sense that it resets UI state, but the non-existent generation was already doing nothing. The Stop button is purely cosmetic.
+- The **Send button** (chat_composer.dart, line 86–89) calls `_handleSend`, which calls `sendMessage`. The user message is persisted. The assistant placeholder is created. Then... nothing happens. The composer clears and re-enables (since `_isGenerating` is set to `false` in the `finally` block of `_handleSend`). The user sees their message appear, an empty assistant bubble appears briefly, and then `_isGenerating` toggles off. No tokens ever arrive.
+
+**Suggested fix:**
+1. In `ChatControllerNotifier.sendMessage()`, after creating the assistant message placeholder, obtain `InferenceService` via `ref.read(inferenceServiceProvider)`, apply the chat template, call `service.generate(prompt)`, and wire the returned stream to `appendToken()` / `finaliseGeneration()`.
+2. In `cancelGeneration()`, call `service.cancel()`.
+3. Either inject `InferenceService` through Riverpod or expose a provider.
+
+---
+
+## 2. Token Streaming Rendering: Full Markdown Re-parse on Every Token
+
+**Severity: NOTE (performance degradation for long generations)**
+
+`MessageBubble._buildAssistantContent()` (message_bubble.dart, line 154–172) wraps the entire `message.content` in a `MarkdownBody(data: message.content, ...)`. Since `MessageBubble` is a `StatelessWidget` that rebuilds whenever the parent rebuilds (which happens on every stream update from the database), the entire markdown tree is re-parsed on each token.
+
+The plan (Phase 5, item 36) explicitly calls this out:
+> "Add the live-token rendering optimisation: don't rebuild the entire markdown tree on every token (it's quadratic). Instead, maintain a `ValueNotifier<String>` on the in-flight message and use `AnimatedBuilder` so only the trailing paragraph re-parses; switch to full markdown rendering once `GenerationDoneEvent` arrives."
+
+This optimisation is **not implemented**. The current approach works for short messages but will cause visible jank on long generations (30+ seconds of streaming, hundreds of tokens).
+
+**Current pipeline causing the problem:**
+1. Each token → `appendToMessage()` → Drift write → Drift `watch()` fires a new stream event.
+2. `conversationMessagesProvider` emits a new list.
+3. `ChatScreen.build()` re-executes.
+4. `ListView.builder` rebuilds the last `MessageBubble`.
+5. `MarkdownBody` re-parses all accumulated content from scratch.
+
+**Suggested fixes (in priority order):**
+
+**Option A (recommended, matches plan):**
+- In `ChatScreen`, maintain a separate `ValueNotifier<String>` for the in-flight assistant message content, updated directly from the generation stream (not via DB writes during generation).
+- For the last message only when `isGenerating`, render using `AnimatedBuilder` listening to this `ValueNotifier` with a lightweight text widget (not `MarkdownBody`).
+- On `finaliseGeneration`, flush the final content to Drift and switch to full `MarkdownBody` rendering.
+
+**Option B (simpler):**
+- During generation, only write tokens to DB in batches (every N tokens or every 250ms), reducing rebuild frequency.
+- This still causes full re-parses but less often.
+
+---
+
+## 3. Scroll-to-Bottom on Every Frame During Streaming
+
+**Severity: NOTE (potential jank)**
+
+`ChatScreen.build()` (chat_screen.dart, line 92–96) contains:
+
+```dart
+WidgetsBinding.instance.addPostFrameCallback((_) {
+  _scrollToBottom();
+});
+```
+
+This is inside the `messagesAsync.when(data: ...)` builder, which means it fires on **every build** — including every time the streaming messages list updates (potentially multiple times per second during generation).
+
+`_scrollToBottom()` (line 32–39) calls `_scrollController.animateTo(...)` with a 100ms animation. If stream updates arrive faster than 100ms (which is common — many tokens arrive within 20–50ms of each other), animations pile up unboundedly. This causes:
+- Choppy scrolling (each new animation interrupts the previous one).
+- Unnecessary CPU/GPU work on every frame.
+
+**Evidence:** The same `addPostFrameCallback` pattern is on line 92, inside `messagesAsync.when(data:)`. There is no guard, no debounce, no check for whether the list was already at the bottom.
+
+**Suggested fixes:**
+1. Replace with a listener on the messages stream: use `addListener` on `_scrollController` only when `_isGenerating` is true. Or, better:
+2. Use `ScrollController`'s `position` to only auto-scroll if the user is already near the bottom (within ~50px tolerance).
+3. After the first auto-scroll, skip subsequent scrolls until the user scrolls away and back — but this is complex. Simpler: just debounce to ~200ms.
+4. Inline approach: replace `addPostFrameCallback` inside `build()` with a `didUpdateWidget` or an effect that only fires when the message count changes.
+
+**Suggested code pattern:**
+```dart
+// In initState or using a listener
+ScrollPosition position = _scrollController.position;
+position.addListener(() {
+  // Only scroll if user is near bottom
+  if (position.pixels >= position.maxScrollExtent - 50) {
+    _autoScroll = true;
+  } else {
+    _autoScroll = false;
+  }
+});
+```
+
+---
+
+## 4. Empty State UX When No Model Active
+
+**Severity: NOTE (minor UX clarity)**
+
+The chat list screen (chat_list_screen.dart) handles the "no model" state reasonably:
+
+- The FAB (line 58–73) shows "New Chat" but checks `activeModel == null`; if no model, it shows a SnackBar `"Import a model first"`. This is functional but not ideal — the button looks active but does nothing useful.
+- The empty state body (line 89–134) shows a contextual message: `"Import a model from Settings to get started"` when `activeModel == null`, or `'Tap "New Chat" to begin'` when a model exists but no conversations. It also shows a prominent `"Import Model"` button. This is well done.
+
+**Suggested improvements:**
+1. Disable the FAB (grey out, `onPressed: null`) when no model is active, with a tooltip explaining why.
+2. Alternatively, change the FAB label from "New Chat" to "Import a Model First" when no model is active.
+
+---
+
+## 5. ChatScreen Title Handling: Never Updated After Creation
+
+**Severity: NOTE (intentional v1 limitation per plan)**
+
+New conversations are created with the hardcoded title `"New conversation"` (chat_list_screen.dart, line 180). This title is passed to `ChatScreen` as a constructor parameter (line 197) and displayed in the app bar (chat_screen.dart, line 76). The title is never updated.
+
+The plan does **not** mention auto-title generation from the first message. Looking at `ChatRepository.updateConversationTitle()` (chat_repository.dart, line 73–77), the method exists but is never called from the chat controller or chat screen.
+
+**Assessment:** This is clearly intentional for v1. The plan doesn't list auto-titling anywhere. The `updateConversationTitle` method exists as infrastructure for a future feature.
+
+**Suggested fix for v1.1:** After the first assistant message completes, extract the first N characters of the user's first message as a title (or use an LLM-generated title for v2).
+
+---
+
+## 6. Settings Screen Stubs: Thread Count, GPU Backend, Benchmark, Diagnostics
+
+**Severity: NOTE (incomplete but scoped for v1)**
+
+**6a. GPU Backend & Thread Count** (settings_screen.dart, line 48–67):
+- Both show hardcoded default values with `// TODO: Backend override picker` and `// TODO: Thread count picker`.
+- The "GPU Backend" subtitle reads `"Auto (probe at runtime)"` which is accurate for v1.
+- The "Thread Count" subtitle reads `${InferenceConfig.defaults.nThreads} threads` which shows `4`. This is low — the plan mentions `performance cores − 1` which on an 8-core phone would be ~7. But `InferenceConfig.defaults` has `nThreads = 4` (inference_config.dart, line 9). This is a minor mismatch with the plan's recommendation but reasonable for v1.
+
+**6b. Benchmark tile** (settings_screen.dart, line 86–96):
+- Always shows a SnackBar `"Benchmark requires an active model"` regardless of whether a model is active. The `// TODO: Run benchmark` stub is still in place. The plan's Phase 6, item 47 describes a full benchmark implementation that's never been wired.
+
+**6c. Device Diagnostic screen** (settings_screen.dart, line 139–179):
+- Shows `Platform.localHostname` which on Android returns the device's network hostname (e.g., "Pixel-8-Pro"). This is technically non-null on all Android devices (it returns `Build.MODEL` or the device name from the network config). It's not especially useful for a diagnostic screen — `Build.MODEL` and `Build.HARDWARE` would be more relevant. On non-Android platforms, local hostname is more meaningful.
+- The "GPU Backend Status" card (line 166–176) has a `// TODO: Display GPU probe results from BackendProbe`. The `BackendProbeResult` data class exists (backend_probe.dart) and `probeBackends()` is implemented, but it's never called and the results are never surfaced here.
+- The `Platform.` calls (line 144–150) use `dart:io`, which works on Android but would throw on web. The `foreground_service.dart` correctly uses `MissingPluginException` handling; the diagnostic screen does not.
+
+**Suggested fixes:**
+1. Wire `BackendProbe.probe()` results into the diagnostic screen.
+2. Add a check for whether a model is actually active before showing the "Run Benchmark" SnackBar — or change the SnackBar text to be contextual.
+3. For GPU Backend/Thread Count, either remove the `chevron_right` icon (since tapping does nothing) or implement the picker dialogs.
+
+---
+
+## 7. MessageBubble Action Chips: Duplicated `onCopy` Pattern
+
+**Severity: NOTE (code inconsistency)**
+
+`MessageBubble` (message_bubble.dart) has an `onCopy` callback parameter (line 21), and the action chip for Copy (line 136–143) calls `onTap` on it. However, `ChatScreen` never wires `onCopy` — the `MessageBubble` construction (chat_screen.dart, line 112–127) only passes `onRegenerate`, `onEdit`, and `onDeleteFromHere`.
+
+The `_buildActionChip` for Copy (line 136–143) falls back to an **inline** implementation:
+```dart
+() {
+  Clipboard.setData(ClipboardData(text: message.content));
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(content: Text('Copied'), duration: Duration(seconds: 1)),
+  );
+},
+```
+
+This means:
+1. The `onCopy` parameter is dead code — nothing ever passes it.
+2. The copy logic is duplicated inside `MessageBubble` rather than being a callback.
+3. If a parent widget wanted to override copy behaviour (e.g., to track analytics or show a different UI), it cannot.
+
+**Suggested fix:** Wire `onCopy` in `ChatScreen`:
+```dart
+onCopy: () {
+  Clipboard.setData(ClipboardData(text: msg.content));
+  ScaffoldMessenger.of(context).showSnackBar(...);
+},
+```
+And in `MessageBubble`, use the callback:
+```dart
+onTap: onCopy ?? () {
+  Clipboard.setData(ClipboardData(text: message.content));
+  ...
+},
+```
+This preserves the fallback while making the callback actually usable.
+
+---
+
+## 8. Composer `onSubmitted` vs `textInputAction`
+
+**Severity: NOTE (desktop keyboard UX)**
+
+`ChatComposer` (chat_composer.dart, line 55) sets:
+```dart
+textInputAction: TextInputAction.newline,
+```
+
+This means pressing Enter on a desktop keyboard (or the "Enter" key on an Android soft keyboard that supports it) inserts a newline rather than submitting. The user must click the Send button to submit.
+
+`onSubmitted` (line 47) is wired but will never fire on desktop because `TextInputAction.newline` tells the IME "Enter = newline.".
+
+On mobile, the on-screen keyboard contextually shows a "Return" key (or a send icon depending on `textInputAction`). With `TextInputAction.newline`, most mobile keyboards show a return/newline key, not a send key.
+
+**Assessment:** This is a conscious design choice — Shift+Enter for newline, Enter for send, or simply using the Send button. But the current implementation doesn't support any keyboard shortcut for sending. The `onSubmitted` callback is essentially dead code.
+
+**Suggested fix (if Enter-to-send is desired):**
+```dart
+textInputAction: TextInputAction.send,  // Shows a send icon on mobile keyboards
+onSubmitted: widget.isGenerating ? null : (_) => _handleSend(),
+```
+And handle multi-line input by listening for Shift+Enter:
+```dart
+onKeyEvent: (node, event) {
+  if (event is KeyDownEvent &&
+      event.logicalKey == LogicalKeyboardKey.enter &&
+      event.isShiftPressed == false) {
+    _handleSend();
+    return KeyEventResult.handled;
+  }
+  return KeyEventResult.ignored;
+},
+```
+
+**Alternatively**, keep the current behaviour (Enter=newline, button to send) and note it as an intentional design choice for v1. If so, remove the unused `onSubmitted` callback to avoid confusion.
+
+---
+
+## Summary Table
+
+| # | Issue | Severity | File & Line | Status |
+|---|-------|----------|-------------|--------|
+| 1 | `sendMessage` never invokes inference pipeline | **BLOCKER** | chat_providers.dart:88-91 | Fix required before any generation works |
+| 2 | Full markdown re-parse per token, no ValueNotifier optimisation | NOTE | message_bubble.dart:154-172 | Plan-described optimisation unimplemented |
+| 3 | `addPostFrameCallback` in build fires on every frame | NOTE | chat_screen.dart:92-96 | No guard/debounce on scroll |
+| 4 | FAB active when no model — SnackBar is weak UX | NOTE | chat_list_screen.dart:60-72 | Minor polish item |
+| 5 | Title never updated from "New conversation" | NOTE | chat_list_screen.dart:180 | Intentional v1 limitation |
+| 6 | Settings screen stubs (threads, GPU, benchmark, probe) | NOTE | settings_screen.dart:48-176 | To-dos remain unwired |
+| 7 | `onCopy` parameter dead; inline duplicate in MessageBubble | NOTE | message_bubble.dart:21, 136-143 | Trivial fix |
+| 8 | `onSubmitted` never fires with `TextInputAction.newline` | NOTE | chat_composer.dart:55, 47 | No keyboard send shortcut |
+
+---
+
+## Overall Assessment
+
+The UI screens (chat list, chat screen, message bubble, composer, settings, model manager) are well-structured, follow Material 3 conventions, use Riverpod properly for state management, and handle loading/error/empty states correctly. The visual foundation is solid.
+
+**The single blocking issue is #1**: the generate→stream→render pipeline is completely unwired. Every "improvement" to scroll-to-bottom, markdown rendering, or button states is secondary until `sendMessage` actually starts a generation and tokens flow to the UI. The `InferenceService` class exists and is fully functional (inference_service.dart) with `generate()` returning a `Stream<TokenEvent>`, but `ChatControllerNotifier` never calls it.
+
+The remaining 7 items are all NOTE-level issues that don't prevent the app from working once the pipeline is wired. They represent polish, optimisation, and incomplete sections that are scoped for v1 or later.
