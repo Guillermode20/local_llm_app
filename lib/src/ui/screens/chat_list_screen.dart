@@ -4,9 +4,8 @@ import 'package:intl/intl.dart';
 
 import '../../chat/chat_providers.dart';
 import '../../chat/chat_repository.dart';
-import '../../models/model_repository.dart';
 import 'chat_screen.dart';
-import 'model_manager_screen.dart';
+import 'settings_screen.dart';
 
 /// Main screen showing the conversation list.
 class ChatListScreen extends ConsumerWidget {
@@ -15,32 +14,19 @@ class ChatListScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final conversationsAsync = ref.watch(conversationListProvider);
-    final activeModel = ref.watch(activeModelProvider);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Local LLM'),
         actions: [
-          if (activeModel != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Chip(
-                avatar: const Icon(Icons.model_training, size: 16),
-                label: Text(
-                  activeModel.displayName,
-                  style: const TextStyle(fontSize: 11),
-                ),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
           IconButton(
             icon: const Icon(Icons.settings),
-            tooltip: 'Model Manager',
+            tooltip: 'Settings',
             onPressed: () {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (_) => const ModelManagerScreen(),
+                  builder: (_) => const SettingsScreen(),
                 ),
               );
             },
@@ -48,15 +34,7 @@ class ChatListScreen extends ConsumerWidget {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: activeModel == null
-            ? () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Import a model first'),
-                  ),
-                );
-              }
-            : () => _createConversation(context, ref),
+        onPressed: () => _createConversation(context, ref),
         icon: const Icon(Icons.add),
         label: const Text('New Chat'),
       ),
@@ -82,29 +60,12 @@ class ChatListScreen extends ConsumerWidget {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    activeModel == null
-                        ? 'Import a model from Settings to get started'
-                        : 'Tap "New Chat" to begin',
+                    'Tap "New Chat" to begin',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           color:
                               Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
                   ),
-                  if (activeModel == null) ...[
-                    const SizedBox(height: 24),
-                    FilledButton.icon(
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const ModelManagerScreen(),
-                          ),
-                        );
-                      },
-                      icon: const Icon(Icons.add),
-                      label: const Text('Import Model'),
-                    ),
-                  ],
                 ],
               ),
             );
@@ -201,16 +162,9 @@ class ChatListScreen extends ConsumerWidget {
     );
   }
 
-  Future<void> _createConversation(
-      BuildContext context, WidgetRef ref) async {
-    final model = ref.read(activeModelProvider);
-    if (model == null) return;
-
+  Future<void> _createConversation(BuildContext context, WidgetRef ref) async {
     final repo = ref.read(chatRepositoryProvider);
-    final id = await repo.createConversation(
-      title: 'New conversation',
-      modelId: model.id,
-    );
+    final id = await repo.createConversation(title: 'New conversation');
 
     ref.read(activeConversationIdProvider.notifier).state = id;
 

@@ -1,1 +1,22 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Binary files - mark as binary to prevent line-ending conversion
 *.gguf binary
+*.bin binary
+*.model binary
+*.pt binary
+*.pth binary
+*.onnx binary
+
+# Large model-related files that should use Git LFS (if enabled)
+*.gguf filter=lfs diff=lfs merge=lfs -text
+
+# Build artifacts
+*.o binary
+*.a binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.lib binary
+*.exe binary

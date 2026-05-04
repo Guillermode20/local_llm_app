@@ -1,9 +1,6 @@
-import 'dart:async';
-
 import 'package:drift/drift.dart';
 
 import '../db/database.dart';
-import '../inference/inference_event.dart';
 
 // ---------------------------------------------------------------------------
 // Data classes
@@ -20,7 +17,6 @@ class ChatMessage {
     required this.role,
     required this.content,
     required this.createdAt,
-    this.generationMetricsJson,
     this.parentMessageId,
     this.archived = false,
   });
@@ -30,7 +26,6 @@ class ChatMessage {
   final MessageRole role;
   final String content;
   final DateTime createdAt;
-  final String? generationMetricsJson;
   final int? parentMessageId;
   final bool archived;
 
@@ -41,7 +36,6 @@ class ChatMessage {
       role: role,
       content: content ?? this.content,
       createdAt: createdAt,
-      generationMetricsJson: generationMetricsJson,
       parentMessageId: parentMessageId,
       archived: archived ?? this.archived,
     );
@@ -53,7 +47,6 @@ class ConversationSummary {
   const ConversationSummary({
     required this.id,
     required this.title,
-    required this.modelId,
     required this.updatedAt,
     this.lastMessagePreview,
     this.messageCount = 0,
@@ -61,7 +54,6 @@ class ConversationSummary {
 
   final int id;
   final String title;
-  final String modelId;
   final DateTime updatedAt;
   final String? lastMessagePreview;
   final int messageCount;
@@ -80,14 +72,12 @@ class ChatRepository {
   /// Create a new conversation and return its ID.
   Future<int> createConversation({
     required String title,
-    required String modelId,
     String? systemPrompt,
   }) async {
     final now = DateTime.now();
     final id = await db.into(db.conversations).insert(
           ConversationsCompanion.insert(
             title: title,
-            modelId: modelId,
             systemPrompt: Value(systemPrompt),
             createdAt: now,
             updatedAt: now,
@@ -100,7 +90,10 @@ class ChatRepository {
   Future<void> updateConversationTitle(int id, String title) async {
     await (db.update(db.conversations)
           ..where((t) => t.id.equals(id)))
-        .write(ConversationsCompanion(updatedAt: Value(DateTime.now())));
+        .write(ConversationsCompanion(
+          title: Value(title),
+          updatedAt: Value(DateTime.now()),
+        ));
   }
 
   /// Archive a conversation.
@@ -151,7 +144,6 @@ class ChatRepository {
       };
 
       // Single query: get last message content per conversation.
-      // Use a correlated subquery to find the latest message.
       final lastMsgQuery = db.customSelect(
         'SELECT m.conversation_id, m.content FROM messages m '
         'WHERE m.archived = 0 '
@@ -172,7 +164,6 @@ class ChatRepository {
         return ConversationSummary(
           id: row.id,
           title: row.title,
-          modelId: row.modelId,
           updatedAt: row.updatedAt,
           lastMessagePreview: lastMessages[row.id],
           messageCount: counts[row.id] ?? 0,
@@ -214,16 +205,17 @@ class ChatRepository {
     return id;
   }
 
-  /// Create an empty assistant message and return its ID.
+  /// Create an assistant message and return its ID.
   Future<int> createAssistantMessage({
     required int conversationId,
+    required String content,
     int? parentMessageId,
   }) async {
     final id = await db.into(db.messages).insert(
           MessagesCompanion.insert(
             conversationId: conversationId,
             role: 'assistant',
-            content: '',
+            content: content,
             createdAt: DateTime.now(),
             parentMessageId: parentMessageId != null
                 ? Value(parentMessageId)
@@ -232,38 +224,6 @@ class ChatRepository {
         );
     await _touchConversation(conversationId);
     return id;
-  }
-
-  /// Append text to an assistant message (used during streaming).
-  Future<void> appendToMessage(int messageId, String text) async {
-    // Read current content and append — avoids race between read and write.
-    final msg = await (db.select(db.messages)
-          ..where((t) => t.id.equals(messageId)))
-        .getSingleOrNull();
-    if (msg == null) return;
-
-    await (db.update(db.messages)
-          ..where((t) => t.id.equals(messageId)))
-        .write(MessagesCompanion(
-          content: Value(msg.content + text),
-        ));
-  }
-
-  /// Finalise an assistant message with metrics.
-  Future<void> finaliseAssistantMessage(
-    int messageId, {
-    GenerationMetrics? metrics,
-  }) async {
-    await (db.update(db.messages)
-          ..where((t) => t.id.equals(messageId)))
-        .write(MessagesCompanion(
-          generationMetricsJson: Value(metrics != null
-              ? '{"ttft_ms":${metrics.timeToFirstTokenMs},'
-                  '"tok_per_sec":${metrics.tokensPerSec},'
-                  '"n_prompt":${metrics.nPromptTokens},'
-                  '"n_decoded":${metrics.nDecoded}}'
-              : null),
-        ));
   }
 
   /// Mark messages as archived for edit-and-resend branching.
@@ -291,7 +251,7 @@ class ChatRepository {
         .write(const MessagesCompanion(archived: Value(true)));
   }
 
-  /// Get the message history as a list of role-content pairs for template formatting.
+  /// Get the message history as a list of role-content pairs.
   Future<List<Map<String, String>>> getMessageHistory(int conversationId) async {
     final messages = await (db.select(db.messages)
           ..where((t) => t.conversationId.equals(conversationId))
@@ -329,7 +289,6 @@ class ChatRepository {
       role: _parseRole(row.role),
       content: row.content,
       createdAt: row.createdAt,
-      generationMetricsJson: row.generationMetricsJson,
       parentMessageId: row.parentMessageId,
       archived: row.archived,
     );

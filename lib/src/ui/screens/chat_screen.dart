@@ -1,6 +1,5 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../chat/chat_providers.dart';
@@ -25,85 +24,40 @@ class ChatScreen extends ConsumerStatefulWidget {
 
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _scrollController = ScrollController();
-  Timer? _scrollDebounce;
-  bool _scrollListenerSetup = false;
-
-  bool _isGenerating = false;
-
-  /// Whether the user has scrolled away from the bottom.
-  bool _userScrolledAway = false;
 
   @override
   void dispose() {
     _scrollController.dispose();
-    _scrollDebounce?.cancel();
     super.dispose();
   }
 
   void _scrollToBottom() {
-    if (_userScrolledAway) return;
-
-    _scrollDebounce?.cancel();
-    _scrollDebounce = Timer(const Duration(milliseconds: 50), () {
-      if (!_scrollController.hasClients) return;
-      final position = _scrollController.position;
-      // Only auto-scroll if user is near the bottom (within 50px).
-      if (position.pixels >= position.maxScrollExtent - 50 || _isGenerating) {
-        _scrollController.animateTo(
-          position.maxScrollExtent,
-          duration: const Duration(milliseconds: 50),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
-
-  void _onScroll() {
     if (!_scrollController.hasClients) return;
-    final position = _scrollController.position;
-    final atBottom = position.pixels >= position.maxScrollExtent - 50;
-    _userScrolledAway = !atBottom && !_isGenerating;
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 100),
+      curve: Curves.easeOut,
+    );
   }
 
   Future<void> _handleSend(String text) async {
-    setState(() => _isGenerating = true);
-    _userScrolledAway = false;
-    try {
-      await ref
-          .read(chatControllerProvider(widget.conversationId).notifier)
-          .sendMessage(text);
-      _scrollToBottom();
-    } finally {
-      if (mounted) setState(() => _isGenerating = false);
-    }
+    if (text.trim().isEmpty) return;
+    await ref
+        .read(chatControllerProvider(widget.conversationId).notifier)
+        .sendMessage(text);
+    _scrollToBottom();
   }
 
-  void _handleStop() {
+  void _handleEditAndResend(ChatMessage msg, String newContent) {
     ref
         .read(chatControllerProvider(widget.conversationId).notifier)
-        .cancelGeneration();
-    setState(() => _isGenerating = false);
-  }
-
-  void _handleRegenerate(int messageId) {
-    ref
-        .read(chatControllerProvider(widget.conversationId).notifier)
-        .regenerate(messageId);
+        .editAndResend(msg.id, newContent);
   }
 
   @override
   Widget build(BuildContext context) {
     final messagesAsync =
         ref.watch(conversationMessagesProvider(widget.conversationId));
-    final controllerState =
-        ref.watch(chatControllerProvider(widget.conversationId));
-
-    // Track generating state from controller
-    if (controllerState is ChatGenerating) {
-      _isGenerating = true;
-    } else {
-      _isGenerating = false;
-    }
 
     return Scaffold(
       appBar: AppBar(
@@ -112,13 +66,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.tune),
-            tooltip: 'Conversation settings',
-            onPressed: _showSettingsSheet,
-          ),
-        ],
       ),
       body: Column(
         children: [
@@ -126,9 +73,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           Expanded(
             child: messagesAsync.when(
               data: (messages) {
-                // Auto-scroll on new messages (debounced).
+                // Auto-scroll on new messages.
                 if (messages.isNotEmpty) {
-                  _scrollToBottom();
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _scrollToBottom();
+                  });
                 }
 
                 if (messages.isEmpty) {
@@ -164,35 +113,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   );
                 }
 
-                // Track whether user scrolled away from bottom.
-                if (!_scrollListenerSetup) {
-                  _scrollListenerSetup = true;
-                  _scrollController.addListener(_onScroll);
-                }
-
                 return ListView.builder(
                   controller: _scrollController,
                   padding: const EdgeInsets.only(top: 8, bottom: 8),
                   itemCount: messages.length,
                   itemBuilder: (context, index) {
                     final msg = messages[index];
-                    final isLast = index == messages.length - 1;
-
                     return MessageBubble(
                       message: msg,
-                      isGenerating:
-                          isLast && _isGenerating && msg.role == MessageRole.assistant,
-                      onRegenerate:
-                          msg.role == MessageRole.assistant && !_isGenerating
-                              ? () => _handleRegenerate(msg.id)
-                              : null,
                       onEdit: msg.role == MessageRole.user
                           ? () => _editMessage(msg)
                           : null,
                       onDeleteFromHere: () => _deleteFromHere(msg),
-                      onCopy: () {
-                        // onCopy with the default behaviour — can be overridden.
-                      },
+                      onCopy: () => _copyMessage(msg.content),
                     );
                   },
                 );
@@ -205,9 +138,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
           // Composer
           ChatComposer(
-            isGenerating: _isGenerating,
+            isGenerating: false,
             onSend: _handleSend,
-            onStop: _handleStop,
+            onStop: null,
           ),
         ],
       ),
@@ -236,9 +169,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           FilledButton(
             onPressed: () {
               Navigator.pop(ctx);
-              ref
-                  .read(chatControllerProvider(widget.conversationId).notifier)
-                  .editAndResend(msg.id, controller.text.trim());
+              _handleEditAndResend(msg, controller.text.trim());
             },
             child: const Text('Send'),
           ),
@@ -272,24 +203,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
-  void _showSettingsSheet() {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Conversation Settings',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
-            const SizedBox(height: 16),
-            const Text('Settings coming soon...'),
-            const SizedBox(height: 24),
-          ],
-        ),
+  void _copyMessage(String content) {
+    Clipboard.setData(ClipboardData(text: content));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied to clipboard'),
+        duration: Duration(seconds: 1),
       ),
     );
   }

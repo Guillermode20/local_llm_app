@@ -1,0 +1,17 @@
+# Each line is a file pattern followed by one or more owners.
+# These owners will be requested for review when changes are made.
+
+# Global owners for all files
+* @Guillermode20
+
+# Platform-specific runners
+/android/ @Guillermode20
+/ios/ @Guillermode20
+/linux/ @Guillermode20
+/macos/ @Guillermode20
+/windows/ @Guillermode20
+/web/ @Guillermode20
+
+# Native FFI bindings and third-party integrations
+/lib/src/native/ @Guillermode20
+/third_party/ @Guillermode20

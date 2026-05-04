@@ -1,0 +1,30 @@
+name: Tech Debt Tracking
+
+on:
+  schedule:
+    # Run every Monday at 9:00 UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Scan TODO / FIXME Markers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for markers
+        run: |
+          echo "# Tech Debt Report" > todo-report.md
+          echo "" >> todo-report.md
+          echo "Generated: $(date -u)" >> todo-report.md
+          echo "" >> todo-report.md
+          echo "## TODO / FIXME / HACK / XXX Markers" >> todo-report.md
+          echo "" >> todo-report.md
+          echo '```' >> todo-report.md
+          rg -n --heading "TODO|FIXME|HACK|XXX" --type dart lib/ test/ >> todo-report.md
+          echo '```' >> todo-report.md
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tech-debt-report
+          path: todo-report.md

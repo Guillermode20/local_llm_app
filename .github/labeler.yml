@@ -1,0 +1,22 @@
+# Auto-label PRs based on changed paths
+# Priority labels
+priority-high:
+  - changed-files:
+      - any-glob-to-any-file:
+          - lib/src/native/**
+          - lib/src/inference/**
+
+priority-medium:
+  - changed-files:
+      - any-glob-to-any-file:
+          - lib/src/chat/**
+          - lib/src/models/**
+          - lib/src/db/**
+
+priority-low:
+  - changed-files:
+      - any-glob-to-any-file:
+          - lib/src/ui/**
+          - test/**
+          - docs/**
+          - "*.md"

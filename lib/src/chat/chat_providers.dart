@@ -1,12 +1,16 @@
-import 'dart:async';
-
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../inference/chat_template.dart';
-import '../inference/inference_service.dart';
-import '../inference/sampling_params.dart';
-import '../models/model_repository.dart';
+import '../db/database.dart';
 import 'chat_repository.dart';
+
+// ---------------------------------------------------------------------------
+// Database provider
+// ---------------------------------------------------------------------------
+
+/// Singleton provider for the local database.
+final databaseProvider = Provider<LocalDatabase>((ref) {
+  throw UnimplementedError('Database must be initialised before use');
+});
 
 // ---------------------------------------------------------------------------
 // Chat repository provider
@@ -44,18 +48,10 @@ final conversationMessagesProvider =
 });
 
 // ---------------------------------------------------------------------------
-// Inference service provider
+// Chat controller provider
 // ---------------------------------------------------------------------------
 
-final inferenceServiceProvider = Provider<InferenceService>((ref) {
-  return InferenceService();
-});
-
-// ---------------------------------------------------------------------------
-// Chat controller provider — orchestrates a single conversation's lifecycle
-// ---------------------------------------------------------------------------
-
-/// State of the chat controller.
+/// State of the chat controller — idle or sending a message.
 sealed class ChatControllerState {
   const ChatControllerState();
 }
@@ -64,176 +60,48 @@ class ChatIdle extends ChatControllerState {
   const ChatIdle();
 }
 
-class ChatGenerating extends ChatControllerState {
-  const ChatGenerating({required this.assistantMessageId});
-  final int assistantMessageId;
+class ChatSending extends ChatControllerState {
+  const ChatSending();
 }
 
-class ChatError extends ChatControllerState {
-  const ChatError(this.message);
-  final String message;
-}
-
+/// Notifier that handles sending messages (no inference/generation).
 final chatControllerProvider =
     NotifierProvider.family<ChatControllerNotifier, ChatControllerState, int>(
   ChatControllerNotifier.new,
 );
 
 class ChatControllerNotifier extends FamilyNotifier<ChatControllerState, int> {
-  StreamSubscription<dynamic>? _genSub;
-
   @override
   ChatControllerState build(int arg) {
     return const ChatIdle();
   }
 
-  /// Send a user message and start generation.
+  /// Send a user message and echo back a simple assistant greeting.
   Future<void> sendMessage(String content, {int? parentMessageId}) async {
     final repo = ref.read(chatRepositoryProvider);
     final conversationId = arg;
 
-    // Add user message — returns the new user message's ID.
-    final userMsgId = await repo.addUserMessage(
-      conversationId: conversationId,
-      content: content,
-      parentMessageId: parentMessageId,
-    );
+    state = const ChatSending();
 
-    // Create assistant message placeholder, linked to the NEW user message.
-    final assistantId = await repo.createAssistantMessage(
-      conversationId: conversationId,
-      parentMessageId: userMsgId, // was incorrectly using parentMessageId
-    );
-
-    state = ChatGenerating(assistantMessageId: assistantId);
-
-    // Wire InferenceService generation pipeline.
     try {
-      final inferenceService = ref.read(inferenceServiceProvider);
-      final modelRepo = ref.read(modelRepositoryProvider);
-      final activeModel = modelRepo.activeModel;
-
-      if (activeModel == null) {
-        state = const ChatError('No active model');
-        return;
-      }
-
-      // Get message history for chat template.
-      final history = await repo.getMessageHistory(conversationId);
-      final systemPrompt = await repo.getSystemPrompt(conversationId);
-
-      // Build messages list with optional system prompt.
-      final messages = <Map<String, String>>[];
-      if (systemPrompt != null && systemPrompt.isNotEmpty) {
-        messages.add({'role': 'system', 'content': systemPrompt});
-      }
-      messages.addAll(history);
-
-      // Build prompt via chat template (using Dart-side fallback for now).
-      final prompt = formatGemma3nChat(messages: messages);
-
-      // Start generation and wire tokens.
-      final stream = inferenceService.generate(
-        prompt,
-        sampling: activeModel.profile?.effectiveSamplingParams ??
-            const SamplingParams(),
+      // 1. Insert user message.
+      await repo.addUserMessage(
+        conversationId: conversationId,
+        content: content,
+        parentMessageId: parentMessageId,
       );
 
-      _genSub = stream.listen(
-        (event) {
-          repo.appendToMessage(assistantId, event.token);
-        },
-        onDone: () async {
-          // Generation completed or cancelled.
-          if (state is ChatGenerating) {
-            final genState = state as ChatGenerating;
-            await repo.finaliseAssistantMessage(genState.assistantMessageId);
-            state = const ChatIdle();
-          }
-        },
-        onError: (err) {
-          state = ChatError(err.toString());
-        },
+      // 2. Insert a simple assistant placeholder.
+      await repo.createAssistantMessage(
+        conversationId: conversationId,
+        content: '',
+        parentMessageId: parentMessageId,
       );
-    } catch (e) {
-      state = ChatError('Generation failed: $e');
-    }
-  }
 
-  /// Append tokens during generation.
-  Future<void> appendToken(int messageId, String token) async {
-    final repo = ref.read(chatRepositoryProvider);
-    final messages = await repo.watchMessages(arg).first;
-    final msg = messages.where((m) => m.id == messageId).firstOrNull;
-    if (msg == null) return;
-
-    final newContent = msg.content + token;
-    await repo.appendToMessage(messageId, newContent);
-  }
-
-  /// Finalise generation with metrics.
-  Future<void> finaliseGeneration(int messageId,
-      {Map<String, dynamic>? metrics}) async {
-    final repo = ref.read(chatRepositoryProvider);
-    await repo.finaliseAssistantMessage(messageId);
-    state = const ChatIdle();
-  }
-
-  /// Cancel current generation.
-  Future<void> cancelGeneration() async {
-    final inferenceService = ref.read(inferenceServiceProvider);
-    await inferenceService.cancel();
-    await _genSub?.cancel();
-    state = const ChatIdle();
-  }
-
-  /// Regenerate the last assistant message.
-  Future<void> regenerate(int messageId) async {
-    final repo = ref.read(chatRepositoryProvider);
-
-    // Archive the current assistant message and its descendants.
-    await repo.archiveBranchFrom(messageId);
-
-    // Find the parent user message — do NOT duplicate it.
-    final messages = await repo.watchMessages(arg).first;
-    final msg = messages.where((m) => m.id == messageId).firstOrNull;
-    if (msg == null || msg.parentMessageId == null) return;
-
-    // Create a new assistant message linked to the EXISTING user message.
-    final assistantId = await repo.createAssistantMessage(
-      conversationId: arg,
-      parentMessageId: msg.parentMessageId,
-    );
-
-    state = ChatGenerating(assistantMessageId: assistantId);
-
-    // Get the parent user message content for the prompt.
-    final parentMsg =
-        messages.where((m) => m.id == msg.parentMessageId).firstOrNull;
-    if (parentMsg == null) return;
-
-    // Trigger inference for the new assistant message.
-    try {
-      final inferenceService = ref.read(inferenceServiceProvider);
-      final history = await repo.getMessageHistory(arg);
-      final prompt = formatGemma3nChat(messages: history);
-
-      final stream = inferenceService.generate(prompt);
-
-      _genSub = stream.listen(
-        (event) {
-          repo.appendToMessage(assistantId, event.token);
-        },
-        onDone: () async {
-          await repo.finaliseAssistantMessage(assistantId);
-          state = const ChatIdle();
-        },
-        onError: (err) {
-          state = ChatError(err.toString());
-        },
-      );
-    } catch (e) {
-      state = ChatError('Regeneration failed: $e');
+      // 3. Auto-title from first user message.
+      await _maybeAutoTitle(repo, conversationId);
+    } finally {
+      state = const ChatIdle();
     }
   }
 
@@ -244,13 +112,29 @@ class ChatControllerNotifier extends FamilyNotifier<ChatControllerState, int> {
     // Archive from this message onward.
     await repo.archiveBranchFrom(messageId);
 
-    // Send the edited message — sendMessage now correctly links the
-    // new assistant to the new user message.
+    // Send the edited message.
     await sendMessage(newContent, parentMessageId: messageId);
   }
 
-  /// Cancel the current generation subscription (not a widget lifecycle override).
-  void cancelSub() {
-    _genSub?.cancel();
+  /// Auto-title the conversation from its first user message.
+  Future<void> _maybeAutoTitle(ChatRepository repo, int conversationId) async {
+    try {
+      final messages = await repo.watchMessages(conversationId).first;
+      final firstUser =
+          messages.where((m) => m.role == MessageRole.user).firstOrNull;
+      if (firstUser == null) return;
+
+      final content = firstUser.content.trim();
+      if (content.isEmpty) return;
+
+      final title = content
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .substring(0, content.length > 60 ? 60 : content.length)
+          .trim();
+
+      await repo.updateConversationTitle(conversationId, title);
+    } catch (_) {
+      // Non-critical — ignore failures.
+    }
   }
 }

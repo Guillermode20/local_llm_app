@@ -7,26 +7,10 @@ import 'package:sqlite3_flutter_libs/sqlite3_flutter_libs.dart';
 
 part 'database.g.dart';
 
-/// A model entry — a GGUF file imported into app-private storage.
-class ModelEntries extends Table {
-  TextColumn get id => text()(); // UUID
-  TextColumn get originalName => text()();
-  TextColumn get internalPath => text()();
-  IntColumn get sizeBytes => integer()();
-  TextColumn get sha256 => text().nullable()();
-  DateTimeColumn get importedAt => dateTime()();
-  TextColumn get metadataJson => text().nullable()();
-  TextColumn get profileJson => text().nullable()();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
-
-/// A conversation with an LLM.
+/// A conversation.
 class Conversations extends Table {
   IntColumn get id => integer().autoIncrement()();
   TextColumn get title => text()();
-  TextColumn get modelId => text()();
   TextColumn get systemPrompt => text().nullable()();
   DateTimeColumn get createdAt => dateTime()();
   DateTimeColumn get updatedAt => dateTime()();
@@ -40,60 +24,60 @@ class Messages extends Table {
   TextColumn get role => text()();
   TextColumn get content => text()();
   DateTimeColumn get createdAt => dateTime()();
-  TextColumn get generationMetricsJson => text().nullable()();
   IntColumn get parentMessageId => integer().nullable()();
   BoolColumn get archived => boolean().withDefault(const Constant(false))();
 }
 
-/// A benchmark result.
-class Benchmarks extends Table {
-  IntColumn get id => integer().autoIncrement()();
-  TextColumn get modelId => text()();
-  TextColumn get backend => text()();
-  RealColumn get ppTokPerSec => real()();
-  RealColumn get tgTokPerSec => real()();
-  DateTimeColumn get createdAt => dateTime()();
-}
-
 /// The app's local database.
+///
+/// Schema history:
+///   v1 (initial):  Conversations (with model_id), Messages (with
+///                  generation_metrics_json), ModelEntries, Benchmarks, FTS5.
+///   v2 (previous): Dropped ModelEntries table.
+///   v3 (current):  Dropped Benchmarks, FTS5, model_id, generation_metrics_json.
 @DriftDatabase(
-  tables: [ModelEntries, Conversations, Messages, Benchmarks],
+  tables: [Conversations, Messages],
 )
 class LocalDatabase extends _$LocalDatabase {
   LocalDatabase(super.connection);
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration {
     return MigrationStrategy(
       onCreate: (m) async {
         await m.createAll();
-        await customStatement(
-          'CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts '
-          'USING fts5(content, content=messages, content_rowid=id)',
-        );
-        await customStatement(
-          'CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages '
-          'BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END',
-        );
-        await customStatement(
-          'CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages '
-          'BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) '
-          'VALUES(\'delete\', old.id, old.content); END',
-        );
-        await customStatement(
-          'CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages '
-          'BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) '
-          'VALUES(\'delete\', old.id, old.content); '
-          'INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END',
-        );
+      },
+      onUpgrade: (m, from, to) async {
+        // ── v1 → v2: Drop ModelEntries (still needed if jumping v1→v3) ──
+        if (from < 2) {
+          await m.deleteTable('model_entries');
+        }
+
+        // ── v2 → v3: Strip all model/inference artifacts ──
+        if (from < 3) {
+          // Benchmarks table no longer exists in the schema.
+          await m.deleteTable('benchmarks');
+
+          // Remove FTS5 virtual table and its triggers (old v2 migration).
+          await customStatement('DROP TABLE IF EXISTS messages_fts');
+          await customStatement('DROP TRIGGER IF EXISTS messages_ai');
+          await customStatement('DROP TRIGGER IF EXISTS messages_ad');
+          await customStatement('DROP TRIGGER IF EXISTS messages_au');
+
+          // Drop columns that are no longer in the table definitions.
+          await customStatement(
+            'ALTER TABLE conversations DROP COLUMN model_id',
+          );
+          await customStatement(
+            'ALTER TABLE messages DROP COLUMN generation_metrics_json',
+          );
+        }
       },
     );
   }
-
-  String get messagesFtsTable => 'messages_fts';
 }
 
 /// Create the database connection with platform-specific initialisation.

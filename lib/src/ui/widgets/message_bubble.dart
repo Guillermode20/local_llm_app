@@ -4,25 +4,18 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:intl/intl.dart';
 
 import '../../chat/chat_repository.dart';
-import '../../inference/inference_event.dart';
 
 /// A single message bubble in the chat.
 class MessageBubble extends StatelessWidget {
   const MessageBubble({
     super.key,
     required this.message,
-    this.isGenerating = false,
-    this.generationMetrics,
-    this.onRegenerate,
     this.onEdit,
     this.onCopy,
     this.onDeleteFromHere,
   });
 
   final ChatMessage message;
-  final bool isGenerating;
-  final GenerationMetrics? generationMetrics;
-  final VoidCallback? onRegenerate;
   final VoidCallback? onEdit;
   final VoidCallback? onCopy;
   final VoidCallback? onDeleteFromHere;
@@ -88,36 +81,13 @@ class MessageBubble extends StatelessWidget {
                       // Timestamp
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              DateFormat.Hm().format(message.createdAt),
-                              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .onSurfaceVariant,
-                                  ),
-                            ),
-                            if (isGenerating) ...[
-                              const SizedBox(width: 4),
-                              _buildTypingIndicator(context),
-                            ],
-                            if (generationMetrics != null) ...[
-                              const SizedBox(width: 8),
-                              Text(
-                                '${generationMetrics!.tokensPerSec.toStringAsFixed(1)} tok/s',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .labelSmall
-                                    ?.copyWith(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .tertiary,
-                                    ),
+                        child: Text(
+                          DateFormat.Hm().format(message.createdAt),
+                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
                               ),
-                            ],
-                          ],
                         ),
                       ),
                     ],
@@ -129,7 +99,7 @@ class MessageBubble extends StatelessWidget {
             ],
           ),
           // Action buttons
-          if (!isGenerating && message.content.isNotEmpty)
+          if (message.content.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 2, left: 4, right: 4),
               child: Row(
@@ -149,15 +119,6 @@ class MessageBubble extends StatelessWidget {
                       );
                     },
                   ),
-                  if (!isUser) ...[
-                    const SizedBox(width: 4),
-                    _buildActionChip(
-                      context,
-                      Icons.refresh,
-                      'Regenerate',
-                      onRegenerate,
-                    ),
-                  ],
                   if (isUser) ...[
                     const SizedBox(width: 4),
                     _buildActionChip(
@@ -199,7 +160,7 @@ class MessageBubble extends StatelessWidget {
   }
 
   Widget _buildAssistantContent(BuildContext context) {
-    if (message.content.isEmpty && isGenerating) {
+    if (message.content.isEmpty) {
       return const SizedBox(
         height: 20,
         child: Text('...'),
@@ -219,30 +180,6 @@ class MessageBubble extends StatelessWidget {
           color: Theme.of(context).colorScheme.surfaceDim,
           borderRadius: BorderRadius.circular(8),
         ),
-      ),
-    );
-  }
-
-  Widget _buildTypingIndicator(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _dot(context),
-        const SizedBox(width: 3),
-        _dot(context),
-        const SizedBox(width: 3),
-        _dot(context),
-      ],
-    );
-  }
-
-  Widget _dot(BuildContext context) {
-    return Container(
-      width: 6,
-      height: 6,
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.primary,
-        shape: BoxShape.circle,
       ),
     );
   }

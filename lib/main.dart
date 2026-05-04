@@ -1,26 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-import 'src/models/model_repository.dart';
+import 'src/chat/chat_providers.dart';
+import 'src/db/database.dart';
 import 'src/ui/screens/chat_list_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialise database
-  final db = await initDatabase();
-  final sharedPrefs = await SharedPreferences.getInstance();
-
-  // Initialise model repository
-  final modelRepo = ModelRepository(db: db, sharedPrefs: sharedPrefs);
-  await modelRepo.refresh();
+  // Initialise database (for chat persistence).
+  final db = await createDatabase();
 
   runApp(
     ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
-        modelRepositoryProvider.overrideWithValue(modelRepo),
       ],
       child: const MainApp(),
     ),

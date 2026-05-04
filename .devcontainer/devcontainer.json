@@ -1,0 +1,31 @@
+{
+  "name": "Local LLM App",
+  "image": "mcr.microsoft.com/devcontainers/dart:3",
+  "features": {
+    "ghcr.io/devcontainers/features/flutter:1": {
+      "version": "3.24"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "Dart-Code.dart-code",
+        "Dart-Code.flutter",
+        "nash.awesome-flutter-snippets"
+      ],
+      "settings": {
+        "dart.runPubGetOnPubspecChanges": true,
+        "dart.checkForUpdates": false,
+        "files.autoSave": "onFocusChange",
+        "editor.formatOnSave": true,
+        "editor.renderWhitespace": "boundary",
+        "editor.rulers": [80]
+      }
+    }
+  },
+  "postCreateCommand": "flutter pub get",
+  "containerEnv": {
+    "FLUTTER_VERSION": "3.24"
+  },
+  "runArgs": ["--name=local_llm_app_dev"]
+}
